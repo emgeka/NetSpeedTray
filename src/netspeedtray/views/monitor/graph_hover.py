@@ -14,7 +14,7 @@ top-level matplotlib import here is fine - this module is only imported from ins
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import numpy as np
 import matplotlib.dates as mdates
@@ -24,9 +24,11 @@ from PyQt6.QtWidgets import QLabel
 from netspeedtray.utils import styles as su
 from netspeedtray.constants.styles import styles as tokens
 from netspeedtray.utils.helpers import format_speed
+from netspeedtray import constants
 
 # Don't pop a tooltip when the cursor is miles from any point (in axis-fraction of the x-range).
 _MAX_SNAP_FRAC = 0.04
+_PIXEL_SLACK = 1.5      # the cursor's pixel column plus half a pixel each side - what the eye reads
 
 
 class GraphHoverTooltip(QObject):
@@ -87,26 +89,7 @@ class GraphHoverTooltip(QObject):
             if ax is None or event.xdata is None or self._label is None:
                 self._hide()
                 return
-            xmin, xmax = ax.get_xlim()
-            span = (xmax - xmin) or 1.0
-            rows: List[Tuple[str, float, str]] = []   # (label, y, color)
-            nearest_x = None
-            best_dx = None
-            for line in ax.get_lines():
-                lbl = line.get_label()
-                if not lbl or lbl.startswith("_"):     # skip crosshairs / non-legend helper lines
-                    continue
-                xd = np.asarray(line.get_xdata(), dtype=float)
-                yd = np.asarray(line.get_ydata(), dtype=float)
-                if xd.size == 0 or yd.size != xd.size:
-                    continue
-                idx = int(np.argmin(np.abs(xd - event.xdata)))
-                dx = abs(xd[idx] - event.xdata)
-                if dx > span * _MAX_SNAP_FRAC:          # cursor too far from this line's samples
-                    continue
-                rows.append((str(lbl), float(yd[idx]), line.get_color()))
-                if best_dx is None or dx < best_dx:
-                    best_dx, nearest_x = dx, xd[idx]
+            rows, nearest_x = self._rows_at(ax, event.xdata)
             if not rows or nearest_x is None:
                 self._hide()
                 return
@@ -118,12 +101,63 @@ class GraphHoverTooltip(QObject):
             self.logger.debug("hover move skipped: %s", e)
             self._hide()
 
+    def _rows_at(self, ax, x: float) -> Tuple[List[Tuple[str, float, str]], Optional[float]]:
+        """The value of every labelled series under the cursor, plus the x of the sample reported.
+
+        "Under the cursor" means the highest sample within the pixel column the cursor is on
+        (plus a pixel of slack), not the sample nearest `x`. At the one-hour window a pixel is
+        about two seconds and a spike is one sample wide, so nearest-x picks the spike's neighbour
+        half the time: the owner hovered a 12 Mbps spike and read 0.8. The line is drawn through
+        the peak, so the peak is the honest readout. Where nothing falls inside the column (sparse
+        data) the nearest sample within the snap distance is used, as before.
+
+        Lines without a legend label (matplotlib's `_childN`) are helpers - crosshairs and the
+        renderer's dashed zero bridges across gaps - and are skipped, so the hover never reports a
+        synthesized zero as a measurement. The renderer draws one series as several segments when
+        the data has gaps; those share a label and collapse to ONE row. X is read in axis units
+        (`orig=False`), which is what `event.xdata` is in - the original data are datetimes.
+        """
+        xmin, xmax = ax.get_xlim()
+        span = (xmax - xmin) or 1.0
+        width_px = float(getattr(ax.bbox, "width", 0.0) or 0.0)
+        column = span / width_px * _PIXEL_SLACK if width_px > 0 else 0.0   # data units per pixel column
+        # label -> (rank, y, color, x_at, dx); rank sorts in-column peaks before nearest fallbacks
+        best: Dict[str, Tuple[Tuple[int, float], float, str, float, float]] = {}
+        for line in ax.get_lines():
+            lbl = line.get_label()
+            if not lbl or str(lbl).startswith("_"):
+                continue
+            xd = np.asarray(line.get_xdata(orig=False), dtype=float)
+            yd = np.asarray(line.get_ydata(orig=False), dtype=float)
+            if xd.size == 0 or yd.size != xd.size:
+                continue
+            dist = np.abs(xd - x)
+            in_column = np.flatnonzero(dist <= column) if column > 0 else np.empty(0, dtype=int)
+            if in_column.size:
+                idx = int(in_column[np.argmax(yd[in_column])])       # the peak the line draws here
+                rank = (0, -float(yd[idx]))
+            else:
+                idx = int(np.argmin(dist))
+                if dist[idx] > span * _MAX_SNAP_FRAC:               # cursor too far from this line
+                    continue
+                rank = (1, float(dist[idx]))
+            cur = best.get(str(lbl))
+            if cur is None or rank < cur[0]:
+                best[str(lbl)] = (rank, float(yd[idx]), line.get_color(), float(xd[idx]), float(dist[idx]))
+        if not best:
+            return [], None
+        rows = [(lbl, y, color) for lbl, (_r, y, color, _xa, _dx) in best.items()]
+        at = min(best.values(), key=lambda t: t[0])[3]                   # the reported peak's time
+        return rows, at
+
     def _format(self, x_num: float, rows: List[Tuple[str, float, str]]) -> str:
         when = mdates.num2date(x_num).strftime("%H:%M:%S")
         is_net = self._host._current_stat == "network"
         parts = [f"<span style='color:{su.semantic_colors()['text_secondary']};'>{when}</span>"]
         for lbl, y, color in rows:
-            val = self._fmt_speed(y) if is_net else f"{y:.0f}%"
+            # The network axes are plotted in Mbps (the renderer converts bytes/sec before plotting)
+            # but format_speed() takes bytes/sec - convert back, or every readout is off by 125,000x.
+            val = self._fmt_speed(y * constants.network.units.MEGA_DIVISOR / constants.network.units.BITS_PER_BYTE) if is_net else f"{y:.0f}%"
             parts.append(f"<span style='color:{color};'>{lbl}</span> {val}")
         return "<br>".join(parts)
 

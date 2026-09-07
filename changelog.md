@@ -75,6 +75,204 @@ ALSO
 
 ---
 
+## [2.1.6] - September 6, 2026
+
+The hotfix for the in-app updater. Since 2.1.4 it downloaded and verified every update and then
+threw it away. If you are on 2.1.4 or 2.1.5, update **once by hand** - after that, updates are one
+click again.
+
+> **Upgrading from 2.1.4 or 2.1.5:** the built-in updater in those versions cannot finish an update
+> (below). Download the installer from the release page and run it, or use `winget upgrade`, or the
+> Microsoft Store. You only have to do this once.
+
+### Fixed
+
+- **In-app updates no longer end in nothing.** Since 2.1.4, every update downloaded, verified, and
+  then silently deleted itself: the progress window closing counted as you pressing Cancel. Both the
+  installer and the portable paths were affected. ([#296], [#260])
+
+  *Under the hood: Qt's `QProgressDialog` emits `canceled()` from its close event, not only from
+  the Cancel button. `_close_progress()` closed the dialog one line before `_on_verified` checked
+  the cancelled flag, so the finished download was cleaned up and the updater returned without a
+  log line - the one silent path in the module. The dialog is now detached and silenced before it
+  is closed, a late `canceled` is ignored, and the cancel path logs. The regression tests drive a
+  real `QProgressDialog`; the sixteen updater tests that existed never built one.*
+
+- **The update installs itself and brings the app back.** One click, and about ten seconds later
+  NetSpeedTray is running on the new version - no wizard, no copying files. Declining the
+  permission prompt keeps the app running and opens the download page instead of leaving you with
+  nothing.
+
+  *Under the hood: even with the cancel bug fixed, nothing installed. Two more mechanisms, both
+  measured live. Windows tears down an elevated process when the process that requested it exits,
+  so quitting for the installer killed it. Keeping the app alive got further, and then the
+  installer's own `taskkill /F /IM NetSpeedTray.exe /T` walked the tree it was standing in - as a
+  descendant of the app, it killed itself mid-install, its log stopping inside the line that
+  announces the taskkill. The app now elevates a shell that starts the installer and exits, so the
+  installer is orphaned and the update survives the app quitting, being killed, or crashing. The
+  app no longer quits at all; the installer closes it, exactly as a Store or winget upgrade does.
+  `/T` is gone from the installer - `/IM` always ended every process with that name.*
+
+- **An update that goes wrong now says so.** The installer writes its own log next to the app's, so
+  a support bundle shows what happened after the app handed over, and if the installer never
+  replaces the running version the app reports it instead of waiting silently.
+
+### Developer notes
+
+- 1,371 tests. Every fix was reproduced with a failing test first, then the whole path was verified
+  live: a client labeled 2.1.4 built from this code, installed, and updated to the published 2.1.5
+  release by pressing Download - twelve seconds from click to the new version running. The target
+  was the 2.1.5 installer, so the app-side fix stands on its own.
+
+[#260]: https://github.com/erez-c137/NetSpeedTray/issues/260
+[#296]: https://github.com/erez-c137/NetSpeedTray/issues/296
+
+---
+
+## [2.1.5] - September 4, 2026
+
+The release that makes rolling back safe - the escape hatch the 2.2 beta cycle depends on, plus
+honest numbers on the widget and in every export.
+
+> **Upgrading:** the first launch compacts the history database (the maintainer's own went from
+> 53 MB to 3.7 MB - nothing is deleted, the file was mostly slack). And very light traffic now
+> shows as `0.02 Mbps` instead of `0.0 Mbps` - a display change, not a measurement change.
+
+### Added
+
+- **Opening a database written by a newer NetSpeedTray now shows an on-screen notice, not just a
+  log line.** History stays visible while recording pauses, and the message names the exact
+  backup file to go back to. ([#273])
+
+  *Under the hood: the guard shipped in 2.1.4 but never left the log - four
+  `_schema_incompatible` sites, none emitting a signal. A rolled-back install looked perfectly
+  healthy while recording nothing, forever.*
+
+- **DATABASE.md documents how to restore a pre-migration backup** - including deleting the
+  `-wal`/`-shm` sidecar files first, which is not optional.
+
+  *Under the hood: renaming the `.bak` into place with stale sidecars present lets SQLite replay
+  the newer schema's write-ahead log onto the restored file - `quick_check` says ok, and the old
+  tables are gone.*
+
+- **Your settings are backed up before any migration touches them.** The first time a config
+  written by a different version loads, a pristine copy is kept as `config.json.bak.v<version>`.
+
+- **NetSpeedTray is on the [Microsoft Store](https://apps.microsoft.com/detail/XP9MHWQZJPLQM8).**
+  Same signed installer, same free app, one click from the Store - and the only official listing
+  there. Anything with a similar name is not this project.
+
+- **The updater never offers a prerelease.** When 2.2.0 ships as a beta, trying it will always be
+  a deliberate download - nobody gets moved onto one automatically. ([#264])
+
+### Changed
+
+- **After a silent install, NetSpeedTray starts right away.** Installs from the Microsoft Store
+  and `winget` show no Finish page, so until now the app was simply not running until your next
+  sign-in - and a `winget upgrade` left it closed. The installer now starts it, unelevated. A
+  silent upgrade over a running copy also no longer waits on an invisible "close it?" prompt.
+
+- **The startup cleanup only deletes update folders it created itself, and logs every removal.**
+  A rollback copy like `NetSpeedTray-2.1.5-backup` kept beside the install now survives every
+  launch. ([#264])
+
+- **The read-only refusal message points at your data instead of away from it** - it names the
+  newest backup this version can actually open, and no longer suggests discarding your history
+  as the first option.
+
+### Fixed
+
+- **A config from a different version no longer loses your settings.** An unparseable
+  `config_version` used to reset everything to defaults - and then save the reset. Newer
+  versions are never stamped down, and settings this version doesn't know survive untouched.
+
+- **Coverage and totals are no longer wrong in SMART mode.** Every stats sheet and CSV export
+  reported 0.0% coverage, and bandwidth totals came out halved. ([#273])
+
+  *Under the hood: SMART's `-1.0` sentinel is truthy, so the `or 1.0` idiom let it straight
+  through - and SMART samples every 2.0 s, so normalizing to 1.0 would still be wrong by 2x. One
+  shared resolver now feeds the sampler and all the math. A unit test had pinned the wrong 1 s
+  assumption as spec; the expectation was corrected rather than the code bent to the test.*
+
+- **Speeds at a unit boundary no longer render as `1000.0 Kbps`.** The unit is chosen from the
+  value as displayed, so it promotes to `1.0 Mbps` instead of overflowing the widget's number
+  slot.
+
+- **10 GbE speeds fit the widget.** In always-Mbps mode, `10000.0 Mbps` now promotes to
+  `10.0 Gbps`, without widening the widget for anyone.
+
+- **Light traffic is no longer shown as nothing.** At the default settings, ~3,000 B/s reads
+  `0.02 Mbps` instead of `0.0 Mbps`; a true zero still reads `0.0`.
+
+- **A CPU temperature that never moves is no longer shown as if it were real.** Some boards
+  answer every poll with the same round placeholder (290 K, 300 K), which the widget showed as
+  17 °C or 27 °C forever. Those zones are now ignored; a real sensor still reads normally.
+  ([#275], [#237])
+
+  *Under the hood: ACPI thermal zones report tenths of a kelvin, and a Celsius-derived value
+  never lands on a whole ten-kelvin multiple. A zone that reports one is a placeholder until the
+  first time it changes, after which it is trusted for good. The 0-150 °C range check that let
+  the placeholders through is unchanged.*
+
+- **Hovering the Monitor graph shows a readout on every tab.** It only ever worked on the combined
+  Hardware view; the Network tab and the other Hardware layouts showed nothing. The readout uses
+  your unit setting, and it reports the peak under the cursor, so a one-second spike reads as
+  drawn instead of as its neighbor.
+
+  *Under the hood: two bugs masking each other. Only one plot call passed `label=`, so the
+  tooltip skipped every other line as a helper; and the network axes carry Mbps while the
+  formatter expected bytes/sec, so had it fired it would have read 40 Mbps as 320 bps. A series
+  the renderer splits at gaps now collapses to one row; the dashed zero bridges stay unlabeled
+  so a synthesized zero is never reported as a measurement.*
+
+- **The database file actually shrinks now.** Maintenance compaction was gated on a condition
+  that could not be true for an install's first year (or ever, on "Keep everything") while
+  fragmentation grew from day one. It also no longer leaves a write-ahead log the size of the
+  whole database behind afterwards.
+
+### Security
+
+- **Network adapter names no longer appear in logs or support bundles.** Adapters you have
+  renamed ("Office VPN") are replaced with stable pseudonyms (`NIC-1a2b3c4d`) that still
+  correlate across lines - including lines written by older versions, when a bundle is built.
+  ([#263])
+
+- **privacy.md now says exactly what the app does.** Hardware utilization history is recorded to
+  the local database by default (the off switch lands in 2.2), and adapter-name scrubbing is
+  described honestly as best-effort pseudonymization rather than "not included".
+
+### Localization
+
+- **Italian.** NetSpeedTray now speaks 15 languages - `it_IT` contributed by
+  [@parmacvn-beep](https://github.com/parmacvn-beep). ([#279])
+- **Two new strings** for the database notice are drafted in every language, matched to each
+  file's existing wording; native review continues through [#202].
+
+### Developer notes
+
+- The release pipeline can now ship a beta safely: a prerelease tag publishes as a prerelease
+  (not Latest), skips WinGet entirely, and the build chain accepts `-beta.N` version strings end
+  to end. The false branch is rehearsed by this very release's tag. ([#257])
+- The exe's `FileVersion` string in Explorer's file Properties now reads `2.1.5` (previously
+  `2.1.4.0`-style); the numeric version resource is unchanged.
+- Each release is submitted to the Microsoft Store listing by CI (`store-submit.yml`, which can
+  also be run by hand for an existing release); the Store fetches the installer from the GitHub
+  release asset. Prereleases never reach the Store, by the same guard as WinGet.
+- The signing step waits up to 30 minutes for SignPath approval instead of 10, so a held
+  approval no longer fails the whole run.
+- 1,363 tests, up 138 from 2.1.4. Every fix above landed with a test demonstrated failing first.
+
+[#202]: https://github.com/erez-c137/NetSpeedTray/issues/202
+[#237]: https://github.com/erez-c137/NetSpeedTray/issues/237
+[#257]: https://github.com/erez-c137/NetSpeedTray/issues/257
+[#263]: https://github.com/erez-c137/NetSpeedTray/issues/263
+[#264]: https://github.com/erez-c137/NetSpeedTray/pull/264
+[#273]: https://github.com/erez-c137/NetSpeedTray/pull/273
+[#275]: https://github.com/erez-c137/NetSpeedTray/issues/275
+[#279]: https://github.com/erez-c137/NetSpeedTray/pull/279
+
+---
+
 ## [2.1.4] - August 23, 2026
 
 The portable build updates itself - plus a log that had been drowning out the bugs it was meant to record, and the groundwork that makes the next release safe to try.

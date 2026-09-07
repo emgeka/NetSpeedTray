@@ -6,7 +6,7 @@ the old behavior - so the worst case is never worse than before):
 
     download installer_url -> %TEMP%  (HTTPS, with a progress dialog)
       -> signature_verifier.verify_file()  (WinVerifyTrust + SignPath pin, fail-closed)
-        -> launch the installer + quit the app   (Inno's AppMutex lets it replace us)
+        -> run the installer elevated + silent, and let IT close and replace us
 
 Both the download AND the (potentially network-blocking) signature verification run on
 the worker thread, so the UI never freezes. The download host doesn't have to be
@@ -33,7 +33,7 @@ import urllib.request
 import zipfile
 from typing import Callable, Optional
 
-from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QMessageBox, QProgressDialog, QWidget
 
 from netspeedtray import constants
@@ -89,10 +89,88 @@ def sweep_stale_update_dirs() -> None:
         pass
 
 
-def launch_installer(path: str) -> None:
-    """Launch the (already-verified) installer. The app must then quit so Inno's
-    AppMutex check passes and it can replace the running files."""
-    subprocess.Popen([path], close_fds=True)
+# The switches the Microsoft Store and winget run the installer with - and, since 2.1.5, what makes
+# the installer relaunch the app as the original user when it is done (setup.iss, LaunchAfterSilentInstall).
+INSTALLER_SILENT_ARGS = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
+_ERROR_CANCELLED = 1223
+
+
+class UpdateElevationDeclined(RuntimeError):
+    """The user said No at the UAC prompt. Not a failure of ours - and not a reason to vanish."""
+
+
+def _shell_execute_runas(path: str, params: str, hwnd: int = 0, show: int = 1) -> None:
+    """ShellExecuteEx(runas): start `path` elevated. Blocks until the UAC prompt is answered, then
+    returns once the elevated process exists. Raises UpdateElevationDeclined on ERROR_CANCELLED,
+    OSError on anything else. Isolated so tests can replace it without touching UAC."""
+    import ctypes
+    from ctypes import wintypes as w
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [("cbSize", w.DWORD), ("fMask", w.ULONG), ("hwnd", w.HWND), ("lpVerb", w.LPCWSTR),
+                    ("lpFile", w.LPCWSTR), ("lpParameters", w.LPCWSTR), ("lpDirectory", w.LPCWSTR),
+                    ("nShow", ctypes.c_int), ("hInstApp", w.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+                    ("lpClass", w.LPCWSTR), ("hkeyClass", w.HKEY), ("dwHotKey", w.DWORD),
+                    ("hIcon", w.HANDLE), ("hProcess", w.HANDLE)]
+
+    SEE_MASK_NOCLOSEPROCESS, SEE_MASK_NOASYNC, SEE_MASK_FLAG_NO_UI = 0x40, 0x100, 0x400
+    sei = SHELLEXECUTEINFOW()
+    sei.cbSize = ctypes.sizeof(sei)
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI
+    sei.hwnd = hwnd or None
+    sei.lpVerb = "runas"
+    sei.lpFile = path
+    sei.lpParameters = params
+    sei.lpDirectory = os.path.dirname(path) or None
+    sei.nShow = show
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    if not shell32.ShellExecuteExW(ctypes.byref(sei)):
+        err = ctypes.get_last_error()
+        if err == _ERROR_CANCELLED:
+            raise UpdateElevationDeclined("the UAC prompt was declined")
+        raise OSError(err, f"ShellExecuteEx(runas) failed with Win32 error {err}")
+    if sei.hProcess:
+        ctypes.windll.kernel32.CloseHandle(sei.hProcess)
+
+
+def _installer_log_path() -> str:
+    """Where the elevated installer writes ITS log: next to the app's own log, so a support bundle
+    carries what the installer did. An update that ends in nothing must never be silent again."""
+    from netspeedtray.utils.helpers import get_app_data_path
+    logs = os.path.join(str(get_app_data_path()), "logs")
+    os.makedirs(logs, exist_ok=True)
+    return os.path.join(logs, "update-install.log")
+
+
+def launch_installer(path: str, hwnd: int = 0) -> None:
+    """Start the (already-verified) installer ELEVATED and SILENT. The caller must then STAY ALIVE.
+
+    Why not just `Popen([path])`: that ran the installer's non-elevated stub, which requested
+    elevation on its own after the app had quit - a prompt owned by a process with no window, and a
+    declined prompt left the user with no app and no message (#296, #260). The elevation request is
+    ours now, made while we are the foreground app, with the Store/winget switches - which also make
+    the installer relaunch the app when it is done (since 2.1.5). A declined prompt raises
+    UpdateElevationDeclined, and the app carries on.
+
+    The installer must NOT end up as this process's child, which is what `ShellExecuteEx` on the
+    installer itself produces. Two separate things then kill it (both measured live, 2026-09-06):
+    Windows tears down the elevated process when the requester exits, and the installer's own
+    ``taskkill /F /IM NetSpeedTray.exe /T`` walks the tree it is standing in and kills itself
+    mid-install - its log stops in the middle of the line that says so.
+
+    So we elevate a shell that `start`s the installer and exits immediately. The installer is
+    orphaned before anything can happen to it, and the update no longer depends on this process at
+    all: it survives us quitting, being killed, or crashing.
+    """
+    params = INSTALLER_SILENT_ARGS
+    try:
+        params += f' /LOG="{_installer_log_path()}"'
+    except Exception as e:  # noqa: BLE001 - the log is a nice-to-have, the install is not
+        logger.debug("No installer log path: %s", e)
+    comspec = os.environ.get("COMSPEC") or os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                                        "System32", "cmd.exe")
+    # `start ""` needs the empty title first, or it eats the quoted path as one.
+    _shell_execute_runas(comspec, f'/c start "" "{path}" {params}', hwnd, show=0)
 
 
 def _safe_extract(zip_path: str, dest_dir: str) -> None:
@@ -342,9 +420,13 @@ class SecureUpdater(QObject):
     Orchestrates download -> verify -> launch with a progress dialog and a browser
     fallback. Parented to the widget; self-destructs (deleteLater) when it finishes.
 
-    Emits ``launching`` right before the verified installer starts, so the caller quits.
+    Emits ``launching`` when the app must quit for the update - the PORTABLE hand-off only. The
+    installer path deliberately does NOT quit; see ``_on_verified``.
     """
     launching = pyqtSignal()
+
+    # How long to wait to be closed by the installer before admitting the update did not happen.
+    _REPLACEMENT_TIMEOUT_MS = 180_000
 
     def __init__(self, parent_widget: QWidget, installer_url: str, release_url: str, i18n,
                  *, portable: bool = False, portable_url: str = "", latest_version: str = "") -> None:
@@ -439,7 +521,12 @@ class SecureUpdater(QObject):
             self._progress.setValue(pct)
 
     def _on_cancel(self) -> None:
+        # Only a live dialog can carry a user's cancel. Once _close_progress() has detached it, any
+        # late `canceled` is the dialog being closed by us, not by the user (see _close_progress).
+        if self._progress is None:
+            return
         self._user_cancelled = True
+        logger.info("Update cancelled by the user.")
         if self._worker is not None:
             self._worker.cancel()
 
@@ -447,6 +534,7 @@ class SecureUpdater(QObject):
         self._teardown_thread()
         self._close_progress()
         if self._user_cancelled:
+            logger.info("Update cancelled before the installer was launched; download discarded.")
             self._cleanup_file()
             self._finish()
             return
@@ -456,13 +544,38 @@ class SecureUpdater(QObject):
             self._fallback(f"signature check failed: {reason}")
             return
         try:
-            launch_installer(path)
-            self.launching.emit()
-            self._finish()
+            hwnd = 0
+            try:
+                if self._parent is not None:
+                    hwnd = int(self._parent.winId())
+            except Exception:  # noqa: BLE001
+                hwnd = 0
+            launch_installer(path, hwnd)
+            # Do NOT quit here. Windows ties the elevated installer to the process that requested
+            # it: quitting immediately after ShellExecuteEx killed the installer outright before it
+            # wrote a single line of its own log (measured 2026-09-06 - the app vanished and nothing
+            # was installed). Staying alive costs nothing, because the installer closes us itself
+            # (CloseApplications=force plus the explicit taskkill in setup.iss) and then relaunches
+            # the new version. If we are somehow still here later, _not_replaced() says so.
+            logger.info("Verified installer started elevated and silent; waiting for it to replace this version.")
+            QTimer.singleShot(self._REPLACEMENT_TIMEOUT_MS, self._not_replaced)
+        except UpdateElevationDeclined:
+            logger.info("Update cancelled at the UAC prompt; staying on the current version.")
+            self._cleanup_file()
+            self._fallback("the elevation prompt was declined")
         except Exception as e:  # noqa: BLE001
             logger.error("Could not launch installer: %s", e, exc_info=True)
             self._cleanup_file()
             self._fallback(f"could not start the installer: {e}")
+
+    def _not_replaced(self) -> None:
+        """Still running three minutes after the installer started: it did not replace us. Say so
+        instead of leaving the user to wonder - the silence is what made this class of bug live for
+        three releases (#296, #260)."""
+        logger.warning("Still running %s after starting the installer; the update did not complete.",
+                       constants.app.VERSION)
+        self._cleanup_file()
+        self._fallback("the installer did not replace this version")
 
     def _on_staged(self, ready: str) -> None:
         """
@@ -517,7 +630,7 @@ class SecureUpdater(QObject):
         the fallback rather than the user being left with nothing.
         """
         try:
-            from netspeedtray.core.update_applier import APP_EXE, validate
+            from netspeedtray.core.update_applier import APP_EXE, record_staged_path, validate
             reason = validate(app_dir, ready)
             if reason:
                 logger.info("Hands-off update not available (%s); using the guided copy.", reason)
@@ -534,7 +647,11 @@ class SecureUpdater(QObject):
             logger.error("Could not hand off to the staged copy; using the guided copy.", exc_info=True)
             return False
 
-        # Only now commit: quitting is what lets the swap proceed.
+        # Only now commit: quitting is what lets the swap proceed. Record the staged folder for
+        # the startup sweep, which removes ONLY recorded paths - the applier cannot delete the
+        # folder it runs from, and without the record it would linger in Downloads forever, while
+        # recording any earlier would mark the very folder the guided fallback hands the user.
+        record_staged_path(ready)
         self._finish()
         self.launching.emit()
         return True
@@ -557,9 +674,19 @@ class SecureUpdater(QObject):
         self._worker = None
 
     def _close_progress(self) -> None:
-        if self._progress is not None:
-            self._progress.close()  # WA_DeleteOnClose -> destroyed
-            self._progress = None
+        # QProgressDialog emits `canceled()` from its CLOSE EVENT, not only from the Cancel button.
+        # Closing the dialog with the signal still wired ran _on_cancel, and the very next line of
+        # _on_verified / _on_staged then treated the finished download as cancelled: it deleted the
+        # verified installer and returned without a word (#296, and #260 before it). Detach the
+        # dialog first, and silence it, so closing it can never look like a cancel.
+        dlg, self._progress = self._progress, None
+        if dlg is not None:
+            try:
+                dlg.canceled.disconnect(self._on_cancel)
+            except (TypeError, RuntimeError):
+                pass
+            dlg.blockSignals(True)
+            dlg.close()  # WA_DeleteOnClose -> destroyed
 
     def _cleanup_file(self) -> None:
         # Remove the whole private download directory (and the installer in it).

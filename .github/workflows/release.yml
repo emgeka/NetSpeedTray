@@ -70,6 +70,9 @@ jobs:
           signing-policy-slug: "release-signing"
           github-artifact-id: ${{ steps.upload_installer.outputs.artifact-id }}
           output-artifact-directory: "signed-installer"
+          # SignPath holds rapid successive requests for manual approval; the default 600 s wait
+          # failed a whole release run once (v2.1.2). 30 min gives the owner time to approve.
+          wait-for-completion-timeout-in-seconds: 1800
 
       - name: Submit Portable ZIP to SignPath
         uses: signpath/github-action-submit-signing-request@v2
@@ -81,6 +84,7 @@ jobs:
           signing-policy-slug: "release-signing"
           github-artifact-id: ${{ steps.upload_portable.outputs.artifact-id }}
           output-artifact-directory: "signed-portable"
+          wait-for-completion-timeout-in-seconds: 1800
 
       # --- Calculate Checksums of SIGNED files ---
       - name: Generate Checksums
@@ -106,11 +110,19 @@ jobs:
             signed-installer/**/*
             signed-portable/**/*
             checksums.txt
+          # A tag with a '-' is a prerelease (v2.2.0-beta.1). Without these two flags the
+          # action defaults prerelease to false and the API defaults make_latest to true,
+          # so a beta would become /releases/latest - the endpoint the in-app updater polls.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   submit-to-winget:
     needs: build-and-sign
+    # Never submit a prerelease to WinGet - this guard is independent of the
+    # prerelease flag above; without it every tag lands in microsoft/winget-pkgs.
+    if: "!contains(github.ref_name, '-')"
     runs-on: ubuntu-latest
     steps:
       - name: Sync WinGet Fork
@@ -129,3 +141,14 @@ jobs:
           
           # The token you just created
           token: ${{ secrets.WINGET_TOKEN }}
+
+  submit-to-msstore:
+    needs: build-and-sign
+    # Same guard as WinGet: a prerelease must never reach the Store listing. The implementation
+    # lives in store-submit.yml (one payload, also runnable by hand for a repair) and carries its
+    # own continue-on-error, so a Partner Center hiccup never fails the release run.
+    if: "!contains(github.ref_name, '-')"
+    uses: ./.github/workflows/store-submit.yml
+    with:
+      version: ${{ github.ref_name }}
+    secrets: inherit
