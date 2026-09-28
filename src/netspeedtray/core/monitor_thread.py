@@ -60,6 +60,7 @@ logger = logging.getLogger("NetSpeedTray.StatsMonitorThread")
 # Network identity (Wi-Fi band / SSID) changes rarely, so poll it on a slow sub-cadence off the
 # per-second network readout - never on the GUI thread. See releases/v2.1/KICKOFF.md §2/§3.
 _IDENTITY_POLL_INTERVAL_SEC: float = 5.0
+_GPU_QUERY_RETRY_SEC: float = 30.0
 
 # LibreHardwareMonitor identifier prefixes that scope a sensor to something that is NOT the CPU.
 # The CPU-temperature search falls back to matching sensor *names* (for boards that label the die
@@ -79,7 +80,8 @@ class GpuPollResult(NamedTuple):
     vram_total: Optional[float] = None
     temp: Optional[float] = None
     power: Optional[float] = None
-    present: bool = False   # True only when GPU Engine util counters were actually found
+    # A PDH engine instance or a hardware-scoped LHM GPU sensor proves presence.
+    present: bool = False
 
 
 class StatsMonitorThread(QThread):
@@ -152,6 +154,8 @@ class StatsMonitorThread(QThread):
         # per-instance handles snapshotted at startup (see _init_gpu_query for why).
         self._gpu_util_counter: Optional[int] = None
         self._gpu_vram_counter: Optional[int] = None
+        # A missing/broken PDH provider must not be re-opened on every one-second poll.
+        self._gpu_query_retry_after: float = 0.0
         # Latched: True once the wildcard has ever returned at least one GPU Engine instance.
         # AddCounter on a wildcard path succeeds whenever the counter OBJECT exists, so it is not
         # evidence of a GPU - deriving "present" from it would fabricate a 0% readout on RDP
@@ -281,8 +285,12 @@ class StatsMonitorThread(QThread):
         - Power via LHM/OHM WMI (all vendors) → nvidia-smi (NVIDIA) → PDH RAPL PP1 (Intel iGPU)
         Returns: GpuPollResult named tuple
         """
-        if not self._gpu_query:
-            self._init_gpu_query()
+        now_mono = time.monotonic()
+        if not self._gpu_query and now_mono >= self._gpu_query_retry_after:
+            if self._init_gpu_query():
+                self._gpu_query_retry_after = 0.0
+            else:
+                self._gpu_query_retry_after = now_mono + _GPU_QUERY_RETRY_SEC
 
         util_pct = 0.0
         vram_used = None   # None = no VRAM counter available -> N/A (not a misleading "0.0 GB used")
@@ -290,45 +298,46 @@ class StatsMonitorThread(QThread):
         temp_c = None
         power_w = None
 
-        try:
-            win32pdh.CollectQueryData(self._gpu_query)
+        if self._gpu_query:
+            try:
+                win32pdh.CollectQueryData(self._gpu_query)
 
-            # 1. Broad Utilization (Max among engines, usually represents 3D load).
-            # The wildcard re-expands each collection, so processes started after us are included.
-            if self._gpu_util_counter is not None:
-                try:
-                    arr = win32pdh.GetFormattedCounterArray(
-                        self._gpu_util_counter, win32pdh.PDH_FMT_DOUBLE)
-                    if arr:
-                        # A non-empty array is the only honest proof a GPU engine exists. Latched,
-                        # because the array is legitimately empty on an idle tick and we must not
-                        # flap the Monitor's GPU tiles in and out.
-                        self._gpu_engine_seen = True
-                    for val in arr.values():
-                        if isinstance(val, (int, float)):
-                            util_pct = max(util_pct, float(val))
-                except Exception as e:
-                    self.logger.debug("GPU utilization array read failed: %s", e)
+                # 1. Broad Utilization (Max among engines, usually represents 3D load).
+                # The wildcard re-expands each collection, so processes started after us are included.
+                if self._gpu_util_counter is not None:
+                    try:
+                        arr = win32pdh.GetFormattedCounterArray(
+                            self._gpu_util_counter, win32pdh.PDH_FMT_DOUBLE)
+                        if arr:
+                            # A non-empty array is the only honest proof a GPU engine exists. Latched,
+                            # because the array is legitimately empty on an idle tick and we must not
+                            # flap the Monitor's GPU tiles in and out.
+                            self._gpu_engine_seen = True
+                        for val in arr.values():
+                            if isinstance(val, (int, float)):
+                                util_pct = max(util_pct, float(val))
+                    except Exception as e:
+                        self.logger.debug("GPU utilization array read failed: %s", e)
 
-            # 2. Universal VRAM (Dedicated Usage in bytes, convert to MiB). Only report a real
-            # number if at least one instance contributed - otherwise leave None (N/A).
-            if self._gpu_vram_counter is not None:
-                try:
-                    arr = win32pdh.GetFormattedCounterArray(
-                        self._gpu_vram_counter, win32pdh.PDH_FMT_DOUBLE)
-                    _vram_acc = 0.0
-                    _had_vram = False
-                    for val in arr.values():
-                        if isinstance(val, (int, float)):
-                            _vram_acc += (float(val) / (1024.0 * 1024.0))
-                            _had_vram = True
-                    if _had_vram:
-                        vram_used = _vram_acc
-                except Exception as e:
-                    self.logger.debug("GPU VRAM array read failed: %s", e)
+                # 2. Universal VRAM (Dedicated Usage in bytes, convert to MiB). Only report a real
+                # number if at least one instance contributed - otherwise leave None (N/A).
+                if self._gpu_vram_counter is not None:
+                    try:
+                        arr = win32pdh.GetFormattedCounterArray(
+                            self._gpu_vram_counter, win32pdh.PDH_FMT_DOUBLE)
+                        _vram_acc = 0.0
+                        _had_vram = False
+                        for val in arr.values():
+                            if isinstance(val, (int, float)):
+                                _vram_acc += (float(val) / (1024.0 * 1024.0))
+                                _had_vram = True
+                        if _had_vram:
+                            vram_used = _vram_acc
+                    except Exception as e:
+                        self.logger.debug("GPU VRAM array read failed: %s", e)
 
-        except Exception as e:
-            self.logger.debug("GPU PDH polling error: %s", e)
+            except Exception as e:
+                self.logger.debug("GPU PDH polling error: %s", e)
 
         # 3. Temperature & Power - prefer LHM/OHM (all vendors) over nvidia-smi (NVIDIA only)
         need_smi_temp = include_temp
@@ -466,6 +475,9 @@ class StatsMonitorThread(QThread):
 
         # Clamp utilization to [0, 100] - PDH GPU-Engine counters can momentarily read >100%.
         util_pct = max(0.0, min(100.0, util_pct))
+        # LHM's HardwareId-scoped sensor group is independent evidence that a physical GPU
+        # exists. Keeping the row visible with 0% utilization is intentional when PDH is
+        # unavailable: temperature/power remain useful and are not fabricated.
         return GpuPollResult(util_pct, vram_used, vram_total, temp_c, power_w,
                              present=self._gpu_engine_seen or lhm_gpu is not None)
 
@@ -977,6 +989,7 @@ class StatsMonitorThread(QThread):
                 if self._hw_queries_dirty:
                     self._hw_queries_dirty = False
                     self._cleanup_gpu_query()
+                    self._gpu_query_retry_after = 0.0
                     self._cleanup_thermal_query()
                     self._cleanup_power_query()
                     self._wmi_ohm = None   # re-probe LHM/OHM on the next temp poll

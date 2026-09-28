@@ -2,7 +2,12 @@ import json
 import unittest
 from unittest.mock import patch
 
-from netspeedtray.core.lhm_http import LhmHttpClient, parse_lhm_value, parse_snapshot
+from netspeedtray.core.lhm_http import (
+    DEFAULT_URL,
+    LhmHttpClient,
+    parse_lhm_value,
+    parse_snapshot,
+)
 
 
 def hardware(name, hardware_id, *sensors):
@@ -35,6 +40,9 @@ class FakeResponse:
 
 
 class TestLhmHttp(unittest.TestCase):
+    def test_default_url_uses_numeric_loopback(self):
+        self.assertEqual(DEFAULT_URL, "http://127.0.0.1:8085/data.json")
+
     def test_decimal_comma_and_point(self):
         self.assertEqual(parse_lhm_value("58,9 °C"), 58.9)
         self.assertEqual(parse_lhm_value("56.8 W"), 56.8)
@@ -97,14 +105,22 @@ class TestLhmHttp(unittest.TestCase):
         self.assertEqual(client.get_snapshot().cpu_power, 42.0)
         urlopen.assert_called_once()
 
+    @patch("netspeedtray.core.lhm_http.time.monotonic", side_effect=(100.0, 101.0, 131.0))
     @patch("netspeedtray.core.lhm_http.urllib.request.urlopen", side_effect=OSError("offline"))
-    def test_unreachable_endpoint_returns_none(self, _urlopen):
-        self.assertIsNone(LhmHttpClient().get_snapshot())
+    def test_unreachable_endpoint_is_retried_only_after_backoff(self, urlopen, _monotonic):
+        client = LhmHttpClient(failure_backoff_seconds=30.0)
+        self.assertIsNone(client.get_snapshot())
+        self.assertIsNone(client.get_snapshot())
+        self.assertIsNone(client.get_snapshot())
+        self.assertEqual(urlopen.call_count, 2)
 
     @patch("netspeedtray.core.lhm_http.urllib.request.urlopen")
     def test_broken_json_returns_none(self, urlopen):
         urlopen.return_value = FakeResponse(b"{broken")
-        self.assertIsNone(LhmHttpClient().get_snapshot())
+        client = LhmHttpClient()
+        self.assertIsNone(client.get_snapshot())
+        self.assertIsNone(client.get_snapshot())
+        urlopen.assert_called_once()
 
 
 if __name__ == "__main__":

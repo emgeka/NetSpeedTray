@@ -17,9 +17,10 @@ from dataclasses import dataclass
 from typing import Any, Iterator, Optional, Tuple
 
 
-DEFAULT_URL = "http://localhost:8085/data.json"
+DEFAULT_URL = "http://127.0.0.1:8085/data.json"
 DEFAULT_TIMEOUT_SEC = 0.35
 DEFAULT_CACHE_SEC = 0.75
+DEFAULT_FAILURE_BACKOFF_SEC = 30.0
 
 _NUMBER_RE = re.compile(r"[-+]?(?:\d+(?:[.,]\d+)?|[.,]\d+)")
 _CPU_PREFIXES = ("/amdcpu/", "/intelcpu/")
@@ -201,31 +202,41 @@ def parse_snapshot(data: Any) -> LhmSnapshot:
 
 
 class LhmHttpClient:
-    """Small, failure-tolerant client with a per-poll-sized cache."""
+    """Small client with a per-poll cache and a quiet failure backoff."""
 
     def __init__(
         self,
         url: str = DEFAULT_URL,
         timeout: float = DEFAULT_TIMEOUT_SEC,
         cache_seconds: float = DEFAULT_CACHE_SEC,
+        failure_backoff_seconds: float = DEFAULT_FAILURE_BACKOFF_SEC,
     ) -> None:
         self.url = url
         self.timeout = timeout
         self.cache_seconds = cache_seconds
+        self.failure_backoff_seconds = failure_backoff_seconds
         self._cached_at = 0.0
         self._cached: Optional[LhmSnapshot] = None
+        self._retry_after = 0.0
 
     def get_snapshot(self) -> Optional[LhmSnapshot]:
         now = time.monotonic()
         if self._cached is not None and now - self._cached_at < self.cache_seconds:
             return self._cached
+        if now < self._retry_after:
+            return None
         try:
             with urllib.request.urlopen(self.url, timeout=self.timeout) as response:
                 data = json.loads(response.read().decode("utf-8-sig"))
             snapshot = parse_snapshot(data)
         except (OSError, ValueError, TypeError, UnicodeError):
+            # CPU temperature, CPU power and GPU polling share this client. Remember a
+            # failed request so an unavailable/malformed endpoint costs one short timeout,
+            # not one timeout per metric on every one-second poll.
+            self._retry_after = now + self.failure_backoff_seconds
             return None
         self._cached = snapshot
         self._cached_at = now
+        self._retry_after = 0.0
         return snapshot
 
