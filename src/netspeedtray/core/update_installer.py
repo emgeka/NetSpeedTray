@@ -90,7 +90,9 @@ def sweep_stale_update_dirs() -> None:
 
 
 # The switches the Microsoft Store and winget run the installer with - and, since 2.1.5, what makes
-# the installer relaunch the app as the original user when it is done (setup.iss, LaunchAfterSilentInstall).
+# the installer relaunch the app when it is done. Since 2.1.8 that relaunch goes through the running
+# shell so it comes back unelevated even though this updater starts Setup elevated
+# (setup.iss, LaunchSilentViaShell).
 INSTALLER_SILENT_ARGS = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
 _ERROR_CANCELLED = 1223
 
@@ -137,9 +139,9 @@ def _installer_log_path() -> str:
     """Where the elevated installer writes ITS log: next to the app's own log, so a support bundle
     carries what the installer did. An update that ends in nothing must never be silent again."""
     from netspeedtray.utils.helpers import get_app_data_path
-    logs = os.path.join(str(get_app_data_path()), "logs")
+    logs = os.path.join(str(get_app_data_path()), constants.logs.INSTALLER_LOG_SUBDIR)
     os.makedirs(logs, exist_ok=True)
-    return os.path.join(logs, "update-install.log")
+    return os.path.join(logs, constants.logs.INSTALLER_LOG_FILENAME)
 
 
 def launch_installer(path: str, hwnd: int = 0) -> None:

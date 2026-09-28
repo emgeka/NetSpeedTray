@@ -110,6 +110,13 @@ def _collect_system_info(config: Dict[str, Any]) -> str:
     lines.append(f"Architecture:         {platform.machine()}")
     lines.append(f"Python:               {sys.version.split()[0]}")
     lines.append(f"Frozen build:         {getattr(sys, 'frozen', False)}")
+    # #308: an exe flagged "Run as administrator" is silently skipped at sign-in, and an elevated
+    # run is how a config ends up writable only by admins (#307). Both belong in every bundle.
+    from netspeedtray.core.startup_manager import (get_compat_layers, get_startup_approved_state,
+                                                   is_process_elevated)
+    lines.append(f"Process elevated:     {is_process_elevated()}")
+    lines.append(f"Compatibility flags:  {get_compat_layers(sys.executable) or '<none>'}")
+    lines.append(f"Task Manager startup: {get_startup_approved_state(constants.app.APP_NAME)}")
     lines.append("")
     lines.append(f"Configured language:  {config.get('language', '<unset>')}")
     lines.append(f"Configured update_rate: {config.get('update_rate', '<unset>')}s")
@@ -174,7 +181,8 @@ def _scrub_log_text(text: str) -> str:
 
 
 def _list_log_files() -> List[Path]:
-    """Returns all NetSpeedTray log files (current + rotated backups)."""
+    """Returns all NetSpeedTray log files (current + rotated backups), plus the in-app updater's
+    installer log when one exists - 2.1.6 started writing it precisely so bundles would carry it."""
     base = get_app_data_path()
     main = base / constants.logs.LOG_FILENAME
     files: List[Path] = []
@@ -185,6 +193,9 @@ def _list_log_files() -> List[Path]:
         rotated = base / f"{constants.logs.LOG_FILENAME}.{i}"
         if rotated.exists():
             files.append(rotated)
+    installer_log = base / constants.logs.INSTALLER_LOG_SUBDIR / constants.logs.INSTALLER_LOG_FILENAME
+    if installer_log.exists():
+        files.append(installer_log)
     return files
 
 
@@ -237,13 +248,16 @@ def build_support_bundle(
             f"Generated: {datetime.now().isoformat(timespec='seconds')}\n"
             "\n"
             "Contents:\n"
-            "  system_info.txt   - App version, OS, monitor layout (no display names)\n"
+            "  system_info.txt   - App version, OS, monitor layout (no display names),\n"
+            "                      whether the app runs as admin, its Windows compatibility\n"
+            "                      flags, and its Task Manager startup state\n"
             "  config.json       - Your settings (interface names and ping host redacted)\n"
-            "  logs/             - Log files, scrubbed for paths/IPs/MACs/GUIDs/hostnames\n"
+            "  logs/             - Log files, including the in-app updater's installer log,\n"
+            "                      scrubbed for paths/usernames/IPs/MACs/GUIDs/hostnames\n"
             "\n"
             "NOT included:\n"
             "  - App Activity per-process / per-connection data\n"
-            "  - Hostname, MAC addresses\n"
+            "  - Hostname, MAC addresses, your Windows username\n"
             "  - Full GPU model strings, raw device IDs\n"
             "\n"
             "Replaced with placeholders (best-effort scrubbing):\n"
